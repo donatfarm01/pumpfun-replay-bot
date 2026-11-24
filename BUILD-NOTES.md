@@ -110,3 +110,27 @@ Local verification used the kit command line grade local with the process
 driver on the published development window, run twice to compare the action
 logs, plus the kit check without transcripts. The numbers from those runs
 are recorded in the build report handed to the parent, not in this file.
+
+A later round of the same entry was rejected by the grader with a run
+completes timeout, so the bot was reworked for speed without touching the
+trading rules. The cause was work that grew with every coin ever seen:
+each batch rebuilt and sorted the whole coin list twice, scanned it once
+more to sync the account, and recomputed several BigInt divisions per
+trade, while the input reader copied the unread tail of its buffer once
+per line. On the development window that already cost the bot about
+thirteen seconds of processor time per run, and the final window is a
+much larger slice of the same stream on a single processor, so the same
+code would run out of its thirty-minute budget there. The fix keeps a
+small live set of buy candidates and a small set of open positions, and
+re-evaluates a candidate only when its own price or reserves moved, when
+a cooldown of its own expired, or when cash or a position slot freed up
+for every candidate at once. Price rises are compared by
+cross-multiplication against the entry and exit thresholds instead of
+being computed as divisions, prices are kept as plain pairs of integers
+instead of fresh objects per event, and the input reader walks one
+buffer with an offset. The trading rules, constants, order of orders and
+mint ordering are unchanged, and the reworked bot produces the same
+action log byte for byte as the version before it on the development
+window, with the same net profit and loss and the same guardrail
+results, while using about two seconds of processor time per run instead
+of about thirteen.

@@ -38,6 +38,22 @@
 // pairs (virtual SOL reserves over virtual token reserves) so no float ever
 // decides a trade. There is no clock, no randomness and no network use, so
 // two runs over the same data produce the same action log byte for byte.
+//
+// Speed — the dev window carries tens of thousands of batches, and the
+// final window is a much larger slice of the same stream, while the
+// grader gives the bot one CPU and a 30-minute wall budget. The bot
+// therefore never scans all coins in a batch. It keeps a small live set
+// of buy candidates (coins whose trigger armed and which are not
+// completed, positioned, pending or cooling down) and a small set of open
+// positions, and re-evaluates a candidate only when its own price or
+// reserves moved, when a cooldown of its own expired, or when cash or a
+// position slot freed up for every candidate at once. Price comparisons
+// are done as cross-multiplications against the entry and exit
+// thresholds, never as a division, so no BigInt division runs per event.
+// The stdin reader walks one buffer with an offset instead of copying
+// the unread tail once per line. The trading rules themselves are
+// unchanged: the same coins, in the same mint order, get the same orders
+// as the straightforward scan would have produced.
 
 // ---- tunable parameters (all in lamports / basis points / slots) ----
 // Entry is the earliest moment a buy fits the order cap: real reserves of
@@ -58,7 +74,7 @@ const ENTRY_MIN_TRADES = 2; // at least 2 trades observed
 const TAKE_PROFIT_BPS = 8000; // sell at +80% vs entry
 const STOP_LOSS_BPS = -500; // sell at -5% vs entry
 const TRAIL_ARM_BPS = 2000; // arm the trailing exit at +20%
-const TRAIL_DROP_BPS = 1000; // sell on a 10% fall from the peak once armed
+const TRAIL_DROP_BPS = 1000; // sell on a 10% fall from its peak once armed
 const MAX_HOLD_SLOTS = 10000; // time exit after about an hour of slots
 const BUY_RETRY_COOLDOWN_SLOTS = 1000; // wait after a rejected buy before retrying
 const BUY_SLIPPAGE_BPS = 200; // buys fill only near the decision price: a fill
@@ -78,40 +94,71 @@ function u64(v: unknown): bigint {
   return 0n;
 }
 
-// A price is a rational pair: virtual SOL reserves over virtual token reserves.
-interface Price {
-  vs: bigint;
-  vt: bigint;
+// A price is a rational pair: virtual SOL reserves over virtual token
+// reserves, kept as two plain BigInt fields on the coin so no price
+// object is ever allocated per event.
+
+// True when price a sits above price b: aVs/aVt > bVs/bVt, by cross
+// multiplication, with no division.
+function priceAbove(aVs: bigint, aVt: bigint, bVs: bigint, bVt: bigint): boolean {
+  return aVs * bVt > bVs * aVt;
 }
 
-function priceOf(vs: bigint, vt: bigint): Price {
-  return { vs, vt };
+// True when the rise of `now` over `base` is more than `bps` basis
+// points: (now/base - 1) * 10000 > bps, rearranged to
+// 10000 * nowVs * baseVt > (10000 + bps) * baseVs * nowVt. A missing or
+// non-positive base price means a rise of zero, which never exceeds a
+// positive threshold.
+function riseAboveBps(
+  nowVs: bigint,
+  nowVt: bigint,
+  baseVs: bigint,
+  baseVt: bigint,
+  bps: bigint,
+): boolean {
+  if (baseVs <= 0n || baseVt <= 0n || nowVt <= 0n) return false;
+  return 10_000n * nowVs * baseVt > (10_000n + bps) * baseVs * nowVt;
 }
 
-// Rise of `now` over `base`, in basis points, as a signed BigInt.
-// rise = (now/base - 1) * 10000, computed by cross-multiplication.
-function riseBps(now: Price, base: Price): bigint {
-  if (base.vs <= 0n || base.vt <= 0n || now.vt <= 0n) return 0n;
-  const num = (now.vs * base.vt - base.vs * now.vt) * 10_000n;
-  const den = base.vs * now.vt;
-  return num / den;
+// True when the rise of a price over an entry quoted as cost/tokens is
+// at least `num/den` of the entry: a * nowVs * tokens >= b * cost *
+// nowVt, where a/b is the threshold ratio in lowest terms. A missing or
+// non-positive entry means a rise of zero, which never reaches a
+// positive threshold.
+function entryRiseAtLeast(
+  nowVs: bigint,
+  nowVt: bigint,
+  cost: bigint,
+  tokens: bigint,
+  a: bigint,
+  b: bigint,
+): boolean {
+  if (cost <= 0n || tokens <= 0n || nowVt <= 0n) return false;
+  return a * nowVs * tokens >= b * cost * nowVt;
 }
 
-// Rise of the current price over an entry quoted as cost/tokens, in bps.
-function riseOverEntryBps(now: Price, costLamports: bigint, tokens: bigint): bigint {
-  if (costLamports <= 0n || tokens <= 0n || now.vt <= 0n) return 0n;
-  const num = (now.vs * tokens - costLamports * now.vt) * 10_000n;
-  const den = costLamports * now.vt;
-  return num / den;
+// True when the rise of a price over an entry quoted as cost/tokens is
+// at most `num/den` of the entry (used for the stop loss, a negative
+// threshold): a * nowVs * tokens <= b * cost * nowVt.
+function entryRiseAtMost(
+  nowVs: bigint,
+  nowVt: bigint,
+  cost: bigint,
+  tokens: bigint,
+  a: bigint,
+  b: bigint,
+): boolean {
+  if (cost <= 0n || tokens <= 0n || nowVt <= 0n) return false;
+  return a * nowVs * tokens <= b * cost * nowVt;
 }
 
 // ---- per-coin state ----
 interface CoinState {
   mint: string;
-  firstPrice: Price;
-  lastPrice: Price;
-  peakPrice: Price; // peak since the current position opened (else last price)
-  firstSlot: number;
+  lastVs: bigint; // virtual SOL reserves at the latest price
+  lastVt: bigint; // virtual token reserves at the latest price
+  peakVs: bigint; // peak price since the current position opened
+  peakVt: bigint;
   lastSlot: number;
   trades: number;
   buys: number;
@@ -122,8 +169,11 @@ interface CoinState {
   roundTrips: number;
   lastExitSlot: number;
   realSolReserves: bigint; // latest real SOL reserves, from trades or marks
-  triggerPrice: Price | null; // price when real reserves first reached 3 SOL
-  peakSinceTrigger: Price | null; // highest price since the trigger
+  triggerArmed: boolean; // real reserves first reached 3 SOL
+  triggerVs: bigint; // price when the trigger armed
+  triggerVt: bigint;
+  peakTrigVs: bigint; // highest price since the trigger armed
+  peakTrigVt: bigint;
   buyPending: boolean; // a buy order is out and its fill has not come back
   sellPending: boolean; // a sell order is out and its fill has not come back
   buyRejectedSlot: number; // slot of the last rejected buy, for a retry cooldown
@@ -131,6 +181,7 @@ interface CoinState {
   entryCost: bigint; // cost_lamports of the open position
   entryTokens: bigint; // token_amount of the open position
   entrySlot: number; // slot when the open position first appeared
+  syncSeen: boolean; // set while syncing this batch's account snapshot
 }
 
 interface Config {
@@ -150,21 +201,33 @@ const DEFAULT_CONFIG: Config = {
 class Bot {
   private config: Config = DEFAULT_CONFIG;
   private coins = new Map<string, CoinState>();
+  // Live buy candidates: trigger armed, not completed, no position, no
+  // buy pending, fewer than 3 round trips, not cooling down. Only these
+  // are ever considered for a buy, and only the dirty ones are
+  // re-evaluated in a batch.
+  private candidates = new Set<CoinState>();
+  private dirty = new Set<CoinState>();
+  // Coins waiting out a cooldown, mapped to the first slot they may be
+  // considered again (exit cooldown or rejected-buy cooldown).
+  private cooling = new Map<CoinState, number>();
+  // Open positions, at most 5. Only these are ever considered for a sell.
+  private openPositions = new Set<CoinState>();
   private orderCounter = 0;
   private cashLamports = 0n;
   private openPositionCount = 0;
   private reservedLamports = 0n; // cash spoken for by buys still awaiting fills
   private pendingBuys = new Map<string, bigint>(); // client_id -> reserved lamports
+  private fullRescan = false; // cash or a position slot freed: re-check all candidates
 
-  private coin(mint: string, slot: number, price: Price): CoinState {
+  private coin(mint: string, slot: number, vs: bigint, vt: bigint): CoinState {
     let c = this.coins.get(mint);
     if (!c) {
       c = {
         mint,
-        firstPrice: price,
-        lastPrice: price,
-        peakPrice: price,
-        firstSlot: slot,
+        lastVs: vs,
+        lastVt: vt,
+        peakVs: vs,
+        peakVt: vt,
         lastSlot: slot,
         trades: 0,
         buys: 0,
@@ -175,8 +238,11 @@ class Bot {
         roundTrips: 0,
         lastExitSlot: -1_000_000,
         realSolReserves: 0n,
-        triggerPrice: null,
-        peakSinceTrigger: null,
+        triggerArmed: false,
+        triggerVs: 0n,
+        triggerVt: 0n,
+        peakTrigVs: 0n,
+        peakTrigVt: 0n,
         buyPending: false,
         sellPending: false,
         buyRejectedSlot: -1_000_000,
@@ -184,46 +250,97 @@ class Bot {
         entryCost: 0n,
         entryTokens: 0n,
         entrySlot: 0,
+        syncSeen: false,
       };
       this.coins.set(mint, c);
     }
     return c;
   }
 
+  // Admit a coin to the buy-candidate set when it is eligible in every
+  // way except price and cash, which are checked at evaluation time.
+  private maybeCandidate(c: CoinState): void {
+    if (
+      c.triggerArmed &&
+      !c.completed &&
+      !c.hasPosition &&
+      !c.buyPending &&
+      c.roundTrips < MAX_ROUND_TRIPS_PER_MINT &&
+      !this.cooling.has(c)
+    ) {
+      this.candidates.add(c);
+    }
+  }
+
+  private dropCandidate(c: CoinState): void {
+    this.candidates.delete(c);
+    this.dirty.delete(c);
+  }
+
+  // Put a coin on cooldown until the given slot; a later cooldown only
+  // ever extends the wait, never shortens it.
+  private coolDown(c: CoinState, untilSlot: number): void {
+    const prev = this.cooling.get(c);
+    if (prev === undefined || untilSlot > prev) this.cooling.set(c, untilSlot);
+  }
+
   // Record the latest real reserves for a coin, and arm the trigger the
   // first time reserves reach 3 SOL: the trigger price is the price at
   // that moment, and the peak since the trigger tracks how far the price
-  // has run past it.
+  // has run past it. A coin whose peak already ran more than 30% past
+  // the trigger can never be bought again, so it leaves the candidates.
   private refreshReserves(c: CoinState, realSolReserves: bigint): void {
     c.realSolReserves = realSolReserves;
-    if (c.triggerPrice === null && realSolReserves >= BUY_MIN_REAL_SOL) {
-      c.triggerPrice = c.lastPrice;
-      c.peakSinceTrigger = c.lastPrice;
+    if (!c.triggerArmed && realSolReserves >= BUY_MIN_REAL_SOL) {
+      c.triggerArmed = true;
+      c.triggerVs = c.lastVs;
+      c.triggerVt = c.lastVt;
+      c.peakTrigVs = c.lastVs;
+      c.peakTrigVt = c.lastVt;
+      this.maybeCandidate(c);
     }
-    if (c.peakSinceTrigger !== null && riseBps(c.lastPrice, c.peakSinceTrigger) > 0n) {
-      c.peakSinceTrigger = c.lastPrice;
+    if (
+      c.triggerArmed &&
+      priceAbove(c.lastVs, c.lastVt, c.peakTrigVs, c.peakTrigVt)
+    ) {
+      c.peakTrigVs = c.lastVs;
+      c.peakTrigVt = c.lastVt;
+      if (
+        riseAboveBps(
+          c.peakTrigVs,
+          c.peakTrigVt,
+          c.triggerVs,
+          c.triggerVt,
+          BigInt(PEAK_SINCE_TRIGGER_MAX_BPS),
+        )
+      ) {
+        this.dropCandidate(c);
+      }
     }
   }
 
   // Record a fresh price for a coin: last price and peak of an open position.
-  private notePrice(c: CoinState, price: Price): void {
-    c.lastPrice = price;
-    if (c.hasPosition && riseBps(price, c.peakPrice) > 0n) {
-      c.peakPrice = price;
+  private notePrice(c: CoinState, vs: bigint, vt: bigint): void {
+    c.lastVs = vs;
+    c.lastVt = vt;
+    if (c.hasPosition && priceAbove(vs, vt, c.peakVs, c.peakVt)) {
+      c.peakVs = vs;
+      c.peakVt = vt;
     }
   }
 
   private noteTrade(
     mint: string,
     slot: number,
-    price: Price,
+    vs: bigint,
+    vt: bigint,
     isBuy: boolean,
     solAmount: bigint,
     realSolReserves: bigint,
   ): void {
-    const c = this.coin(mint, slot, price);
+    const c = this.coin(mint, slot, vs, vt);
     c.lastSlot = slot;
-    this.notePrice(c, price);
+    this.notePrice(c, vs, vt);
     this.refreshReserves(c, realSolReserves);
     c.trades += 1;
     if (isBuy) {
@@ -233,44 +350,58 @@ class Bot {
       c.sells += 1;
       c.sellVol += solAmount;
     }
-    if (c.hasPosition && riseBps(price, c.peakPrice) > 0n) {
-      c.peakPrice = price;
-    }
+    // A coin whose own price or reserves moved may have become buyable
+    // (or unbuyable), so it is re-evaluated this batch.
+    if (this.candidates.has(c)) this.dirty.add(c);
   }
 
   // Sync open positions from the harness account snapshot (ground truth).
   private syncAccount(account: any, slot: number): void {
-    this.cashLamports = u64(account?.cash_lamports);
-    const seen = new Set<string>();
+    const cash = u64(account?.cash_lamports);
     const positions = Array.isArray(account?.positions) ? account.positions : [];
+    // More cash, or a freed position slot, can make a candidate that was
+    // skipped before buyable now, so every candidate is re-checked.
+    if (cash > this.cashLamports || positions.length < this.openPositionCount) {
+      this.fullRescan = true;
+    }
+    this.cashLamports = cash;
     this.openPositionCount = positions.length;
     for (const p of positions) {
       const mint = String(p.mint);
-      seen.add(mint);
       const cost = u64(p.cost_lamports);
       const tokens = u64(p.token_amount);
       const c = this.coins.get(mint);
       if (!c) continue; // a position in a coin we never saw: hold it, do not trade it
+      c.syncSeen = true;
       if (!c.hasPosition) {
         // A fresh position: record its entry and reset the peak to now.
         c.hasPosition = true;
         c.entryCost = cost;
         c.entryTokens = tokens;
         c.entrySlot = slot;
-        c.peakPrice = c.lastPrice;
+        c.peakVs = c.lastVs;
+        c.peakVt = c.lastVt;
+        this.openPositions.add(c);
+        this.dropCandidate(c);
       } else {
         c.entryCost = cost;
         c.entryTokens = tokens;
       }
     }
-    for (const c of this.coins.values()) {
-      if (c.hasPosition && !seen.has(c.mint)) {
+    for (const c of this.openPositions) {
+      if (!c.syncSeen) {
         // Position closed (sold, completed or written off) since last batch.
         c.hasPosition = false;
         c.roundTrips += 1;
         c.lastExitSlot = slot;
         c.entryCost = 0n;
         c.entryTokens = 0n;
+        this.openPositions.delete(c);
+        if (!c.completed && c.roundTrips < MAX_ROUND_TRIPS_PER_MINT) {
+          this.coolDown(c, slot + REENTRY_COOLDOWN_SLOTS);
+        }
+      } else {
+        c.syncSeen = false;
       }
     }
   }
@@ -281,7 +412,10 @@ class Bot {
     return size;
   }
 
-  private shouldBuy(c: CoinState, slot: number, realSolReserves: bigint, availableCash: bigint): bigint {
+  // The buy size when every gate except cash passes, else 0. Cash is
+  // applied later, in mint order, because it depends on the buys already
+  // queued in the same batch.
+  private buySizeIfEligible(c: CoinState, slot: number, realSolReserves: bigint): bigint {
     if (c.completed) return 0n;
     if (c.hasPosition) return 0n;
     if (c.buyPending) return 0n; // an earlier buy is still awaiting its fill
@@ -290,23 +424,35 @@ class Bot {
     if (slot - c.buyRejectedSlot < BUY_RETRY_COOLDOWN_SLOTS) return 0n;
     if (c.trades < ENTRY_MIN_TRADES) return 0n;
     if (realSolReserves < BUY_MIN_REAL_SOL) return 0n;
-    if (c.triggerPrice === null) return 0n;
+    if (!c.triggerArmed) return 0n;
     // Never chase: the trigger edge is gone once the price has run more
     // than 10% past the trigger price — that entry is a top, not a start.
-    if (riseBps(c.lastPrice, c.triggerPrice) > BigInt(ENTRY_MAX_ABOVE_TRIGGER_BPS)) return 0n;
+    if (
+      riseAboveBps(
+        c.lastVs,
+        c.lastVt,
+        c.triggerVs,
+        c.triggerVt,
+        BigInt(ENTRY_MAX_ABOVE_TRIGGER_BPS),
+      )
+    ) {
+      return 0n;
+    }
     // And never buy a retrace: if the price already ran 30% past the
     // trigger and came back, the move happened without us.
     if (
-      c.peakSinceTrigger !== null &&
-      riseBps(c.peakSinceTrigger, c.triggerPrice) > BigInt(PEAK_SINCE_TRIGGER_MAX_BPS)
+      riseAboveBps(
+        c.peakTrigVs,
+        c.peakTrigVt,
+        c.triggerVs,
+        c.triggerVt,
+        BigInt(PEAK_SINCE_TRIGGER_MAX_BPS),
+      )
     ) {
       return 0n;
     }
     const size = this.buySize(realSolReserves);
     if (size < BUY_SIZE_MIN) return 0n;
-    // Keep enough cash for the trade plus its variable and fixed fees.
-    const need = size + (size * BigInt(FEE_BPS)) / 10_000n + TX_FEE_LAMPORTS;
-    if (availableCash < need) return 0n;
     return size;
   }
 
@@ -315,14 +461,26 @@ class Bot {
     if (!c.hasPosition) return false;
     if (c.sellPending) return false; // a sell is already awaiting its fill
     if (c.completed) return true;
-    const rise = riseOverEntryBps(c.lastPrice, c.entryCost, c.entryTokens);
-    if (rise >= BigInt(TAKE_PROFIT_BPS)) return true;
-    if (rise <= BigInt(STOP_LOSS_BPS)) return true;
-    const peakRise = riseOverEntryBps(c.peakPrice, c.entryCost, c.entryTokens);
-    if (peakRise >= BigInt(TRAIL_ARM_BPS)) {
-      // Once armed, sell when the price has fallen 20% from its peak.
-      const drop = riseBps(c.peakPrice, c.lastPrice);
-      if (drop >= BigInt(TRAIL_DROP_BPS)) return true;
+    // Take profit at +80%: 5 * nowVs * tokens >= 9 * cost * nowVt.
+    if (entryRiseAtLeast(c.lastVs, c.lastVt, c.entryCost, c.entryTokens, 5n, 9n)) {
+      return true;
+    }
+    // Stop loss at -5%: 20 * nowVs * tokens <= 19 * cost * nowVt.
+    if (entryRiseAtMost(c.lastVs, c.lastVt, c.entryCost, c.entryTokens, 20n, 19n)) {
+      return true;
+    }
+    // Trailing exit, armed at +20% from the peak: 5 * peakVs * tokens >=
+    // 6 * cost * peakVt; then sell on a 10% fall from the peak:
+    // 10 * peakVs * lastVt >= 11 * lastVs * peakVt.
+    if (entryRiseAtLeast(c.peakVs, c.peakVt, c.entryCost, c.entryTokens, 5n, 6n)) {
+      if (
+        c.lastVt > 0n &&
+        c.peakVt > 0n &&
+        c.lastVs > 0n &&
+        10n * c.peakVs * c.lastVt >= 11n * c.lastVs * c.peakVt
+      ) {
+        return true;
+      }
     }
     if (slot - c.entrySlot >= MAX_HOLD_SLOTS) return true;
     return false;
@@ -346,17 +504,21 @@ class Bot {
       if (!mint) continue;
       const evSlot = typeof e.slot === "number" ? e.slot : slot;
       if (e.event === "CreateEvent") {
-        const price = priceOf(u64(e.virtual_sol_reserves), u64(e.virtual_token_reserves));
-        const c = this.coin(mint, evSlot, price);
+        const c = this.coin(
+          mint,
+          evSlot,
+          u64(e.virtual_sol_reserves),
+          u64(e.virtual_token_reserves),
+        );
         c.lastSlot = evSlot;
         c.realSolReserves = 0n; // a fresh curve holds no real SOL yet
         if (e.is_mayhem_mode === true) c.completed = true;
       } else if (e.event === "TradeEvent") {
-        const price = priceOf(u64(e.virtual_sol_reserves), u64(e.virtual_token_reserves));
         this.noteTrade(
           mint,
           evSlot,
-          price,
+          u64(e.virtual_sol_reserves),
+          u64(e.virtual_token_reserves),
           e.is_buy === true,
           u64(e.sol_amount),
           u64(e.real_sol_reserves),
@@ -366,6 +528,8 @@ class Bot {
         if (c) {
           c.completed = true;
           c.lastSlot = evSlot;
+          this.dropCandidate(c);
+          this.cooling.delete(c);
         }
       }
     }
@@ -377,12 +541,12 @@ class Bot {
     for (const m of marks) {
       const mint = typeof m.mint === "string" ? m.mint : "";
       if (!mint) continue;
-      const price = priceOf(u64(m.virtual_quote_reserves), u64(m.virtual_token_reserves));
       const c = this.coins.get(mint);
       if (c) {
         c.lastSlot = typeof m.slot === "number" ? m.slot : slot;
-        this.notePrice(c, price);
+        this.notePrice(c, u64(m.virtual_quote_reserves), u64(m.virtual_token_reserves));
         this.refreshReserves(c, u64(m.real_quote_reserves));
+        if (this.candidates.has(c)) this.dirty.add(c);
       }
     }
 
@@ -391,6 +555,7 @@ class Bot {
     // the same intent, remember rejected buys for a retry cooldown, and
     // release the cash a filled or rejected buy had reserved.
     const fills = Array.isArray(batch.fills) ? batch.fills : [];
+    let freedReserved = false;
     for (const f of fills) {
       const c = this.coins.get(String(f.mint));
       if (!c) continue;
@@ -400,24 +565,42 @@ class Bot {
         if (reserved !== undefined) {
           this.pendingBuys.delete(String(f.client_id));
           this.reservedLamports -= reserved;
+          freedReserved = true;
         }
         if (f.status === "rejected" || f.status === "failed") {
           c.buyRejectedSlot = slot;
+          if (c.triggerArmed && !c.completed && c.roundTrips < MAX_ROUND_TRIPS_PER_MINT) {
+            this.coolDown(c, slot + BUY_RETRY_COOLDOWN_SLOTS);
+          }
         }
       } else if (f.side === "sell") {
         c.sellPending = false;
       }
     }
+    if (freedReserved) this.fullRescan = true;
 
     this.syncAccount(batch.account, slot);
+
+    // Cooldowns that expired this batch make their coins candidates
+    // again, and they are re-evaluated now.
+    if (this.cooling.size > 0) {
+      for (const [c, until] of this.cooling) {
+        if (slot >= until) {
+          this.cooling.delete(c);
+          const before = this.candidates.size;
+          this.maybeCandidate(c);
+          if (this.candidates.size > before) this.dirty.add(c);
+        }
+      }
+    }
 
     const orders: any[] = [];
     const maxOrders = Math.max(0, this.config.maxOrdersPerBatch);
 
-    // Sells first, mint-sorted.
-    const held = [...this.coins.values()]
-      .filter((c) => c.hasPosition)
-      .sort((a, b) => (a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0));
+    // Sells first, mint-sorted, from the open positions only.
+    const held = [...this.openPositions].sort((a, b) =>
+      a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0,
+    );
     let sells = 0;
     for (const c of held) {
       if (orders.length >= maxOrders) break;
@@ -433,26 +616,39 @@ class Bot {
       sells += 1;
     }
 
-    // Buys next, mint-sorted, while a position slot is free.
+    // Buys next, mint-sorted, while a position slot is free. Only the
+    // candidates that moved this batch (or every candidate, when cash or
+    // a slot freed up) are evaluated; the eligible ones are then walked
+    // in mint order with the cash check applied as buys are queued, which
+    // is exactly the order the full scan used to produce.
     let freeSlots =
       this.config.maxOpenPositions - this.openPositionCount + sells;
-    const candidates = [...this.coins.values()].sort((a, b) =>
-      a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0,
+    if (this.fullRescan) {
+      for (const c of this.candidates) this.dirty.add(c);
+      this.fullRescan = false;
+    }
+    const eligible: { c: CoinState; size: bigint }[] = [];
+    for (const c of this.dirty) {
+      const size = this.buySizeIfEligible(c, slot, c.realSolReserves);
+      if (size > 0n) eligible.push({ c, size });
+    }
+    this.dirty.clear();
+    eligible.sort((a, b) =>
+      a.c.mint < b.c.mint ? -1 : a.c.mint > b.c.mint ? 1 : 0,
     );
     let spent = 0n;
-    for (const c of candidates) {
+    for (const { c, size } of eligible) {
       if (orders.length >= maxOrders) break;
       if (freeSlots <= 0) break;
-      const real = c.realSolReserves;
       // Cash left after the buys already queued in this batch and the buys
       // of earlier batches still awaiting their fills.
       const available = this.cashLamports - spent - this.reservedLamports;
-      const size = this.shouldBuy(c, slot, real, available);
-      if (size <= 0n) continue;
+      // Keep enough cash for the trade plus its variable and fixed fees.
       const need = size + (size * BigInt(FEE_BPS)) / 10_000n + TX_FEE_LAMPORTS;
       if (available < need) continue;
       spent += need;
       c.buyPending = true;
+      this.dropCandidate(c);
       const clientId = this.nextClientId();
       this.pendingBuys.set(clientId, need);
       this.reservedLamports += need;
@@ -494,33 +690,45 @@ class Bot {
 
 async function main(): Promise<void> {
   const bot = new Bot();
-  let buffer = "";
-  process.stdin.setEncoding("utf8");
-  for await (const chunk of process.stdin) {
-    buffer += chunk;
-    let idx = buffer.indexOf("\n");
-    while (idx !== -1) {
-      const line = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 1);
-      idx = buffer.indexOf("\n");
-      if (!line.trim()) continue;
-      let msg: any;
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (msg.type === "hello") {
-        bot.handleHello(msg);
-      } else if (msg.type === "batch") {
-        const reply = bot.handleBatch(msg);
-        process.stdout.write(JSON.stringify(reply) + "\n");
-      } else if (msg.type === "done") {
-        process.exit(0);
-      }
+  // Offset-based line reader: the buffer is never copied per line, only
+  // compacted when a chunk boundary leaves a partial line behind.
+  let buf = Buffer.alloc(0);
+  let start = 0;
+  const handleLine = (line: string): void => {
+    if (!line.trim()) return;
+    let msg: any;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      return;
     }
-  }
-  process.exit(0);
+    if (msg.type === "hello") {
+      bot.handleHello(msg);
+    } else if (msg.type === "batch") {
+      const reply = bot.handleBatch(msg);
+      process.stdout.write(JSON.stringify(reply) + "\n");
+    } else if (msg.type === "done") {
+      process.exit(0);
+    }
+  };
+  process.stdin.on("data", (chunk: Buffer) => {
+    if (start > 0) {
+      buf = Buffer.from(buf.subarray(start));
+      start = 0;
+    }
+    buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+    let idx = buf.indexOf(10, start);
+    while (idx !== -1) {
+      handleLine(buf.toString("utf8", start, idx));
+      start = idx + 1;
+      idx = buf.indexOf(10, start);
+    }
+    if (start >= buf.length) {
+      buf = Buffer.alloc(0);
+      start = 0;
+    }
+  });
+  process.stdin.on("end", () => process.exit(0));
 }
 
 main().catch(() => process.exit(1));
